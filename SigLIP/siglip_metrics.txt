@@ -1,0 +1,9 @@
+SigLIP Model Results
+====================
+
+Accuracy  : 98.96%
+Precision : 98.95%
+Recall    : 98.95%
+F1 Score  : 98.95%
+Best Val Accuracy : 98.96%
+Training Time : 58m 45s

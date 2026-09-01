@@ -1,0 +1,9 @@
+SigLIP Class-wise Accuracy
+===========================
+
+Bacterial Leaf Blight : 97.64%
+Brown Spot : 99.22%
+Healthy Rice Leaf : 100.00%
+Leaf Blast : 100.00%
+Leaf scald : 97.62%
+Sheath Blight : 99.21%
