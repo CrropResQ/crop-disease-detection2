@@ -1,0 +1,9 @@
+DINOv2 Class-wise Accuracy
+==========================
+
+Bacterial Leaf Blight: 80.31% (102/127)
+Brown Spot: 86.05% (111/129)
+Healthy Rice Leaf: 99.24% (130/131)
+Leaf Blast: 85.83% (109/127)
+Leaf scald: 79.37% (100/126)
+Sheath Blight: 91.27% (115/126)
