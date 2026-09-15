@@ -1,0 +1,44 @@
+
+
+MAXVIT RICE LEAF DISEASE CLASSIFICATION
+========================================
+
+Epochs: 25
+
+Physical Batch Size: 4
+
+Gradient Accumulation:
+8
+
+Effective Batch Size:
+32
+
+Learning Rate:
+0.0001
+
+Image Size:
+224 x 224
+
+Training Images:
+3063
+
+Validation Images:
+766
+
+Best Validation Accuracy:
+99.09%
+
+Final Accuracy:
+99.09%
+
+Precision:
+99.10%
+
+Recall:
+99.09%
+
+F1 Score:
+99.09%
+
+Training Time:
+64.15 minutes
