@@ -1,0 +1,22 @@
+DINOv2 Rice Leaf Classification Metrics
+========================================
+
+Model: DINOv2 ViT-B/14
+Dataset: Rice Leaf AUG
+
+Best Validation Accuracy: 87.08%
+Final Accuracy: 87.08%
+Precision: 87.16%
+Recall: 87.08%
+F1 Score: 87.08%
+
+Total Images: 3829
+Training Images: 3063
+Validation Images: 766
+Number of Classes: 6
+Epochs: 25
+Batch Size: 16
+Learning Rate: 0.0001
+Weight Decay: 0.01
+
+Training Method: DINOv2 frozen + linear classification head

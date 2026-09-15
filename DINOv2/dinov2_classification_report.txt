@@ -1,0 +1,15 @@
+DINOv2 Classification Report
+============================
+
+                       precision    recall  f1-score   support
+
+Bacterial Leaf Blight       0.78      0.80      0.79       127
+           Brown Spot       0.92      0.86      0.89       129
+    Healthy Rice Leaf       0.96      0.99      0.97       131
+           Leaf Blast       0.81      0.86      0.83       127
+           Leaf scald       0.83      0.79      0.81       126
+        Sheath Blight       0.93      0.91      0.92       126
+
+             accuracy                           0.87       766
+            macro avg       0.87      0.87      0.87       766
+         weighted avg       0.87      0.87      0.87       766
