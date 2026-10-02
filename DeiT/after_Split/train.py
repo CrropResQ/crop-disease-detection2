@@ -2485,49 +2485,38 @@ print(LOSS_PLOT)
 print(ACC_PLOT)
 print(CM_PLOT)
 print(CLASS_ACC_PLOT)
-
 print()
 print("CLASSIFICATION REPORT")
 print("-" * 80)
 print(REPORT_TEXT_PATH)
-
 print()
 print("PDF REPORT")
 print("-" * 80)
 print(PDF_PATH)
-
 print()
 print("=" * 80)
 print("FINAL VALIDATION RESULT")
 print("=" * 80)
-
 print(
     f"Accuracy       : {accuracy*100:.2f}%"
 )
-
 print(
     f"Precision      : {precision*100:.2f}%"
 )
-
 print(
     f"Recall         : {recall*100:.2f}%"
 )
-
 print(
     f"F1 Score       : {f1*100:.2f}%"
 )
-
 print(
     f"Best Epoch     : {best_epoch}"
 )
-
 print(
     f"Best Val Acc   : {best_val_acc*100:.2f}%"
-)
-
+) 
 print()
 print("TEST SET: NOT EVALUATED / LOCKED")
-
 print()
 print("=" * 80)
 print("DONE")
