@@ -1,1705 +1,502 @@
-# ==========================================================
-# CoAtNet - Rice Leaf Disease Classification (Kaggle)
-# Improved version with:
-# - Reproducibility
-# - Proper ImageNet normalization
-# - Data augmentation
-# - Stratified 80/20 split
-# - Class distribution check
-# - Mixed precision
-# - Cosine learning-rate scheduler
-# - Label smoothing
-# - Best model restoration
-# - Detailed metrics
-# - Accuracy/Loss graphs
-# - Confusion matrix
-# - PDF report
-# ==========================================================
+# =============================================================
+# CropResQ - CoAtNet Model (Train, Val, Test + Canonical PDF Report)
+# =============================================================
 
-
-# ==========================================================
-# 1. IMPORTS
-# ==========================================================
+# -------------------------------------------------------------
+# 1. Environment & Package Installs
+# -------------------------------------------------------------
+# Note: We use `timm` (PyTorch Image Models) for CoAtNet
+#!pip install -q timm reportlab seaborn matplotlib scikit-learn
 
 import os
+import glob
 import time
-import random
-import copy
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import timm
-
-import matplotlib.pyplot as plt
-import seaborn as sns
-
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, Subset
 
-from sklearn.model_selection import train_test_split
+import timm
 from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
+    classification_report,
     confusion_matrix,
-    classification_report
+    accuracy_score,
+    precision_recall_fscore_support
 )
 
-from tqdm import tqdm
-from matplotlib.backends.backend_pdf import PdfPages
+# PDF Generation Imports
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, PageBreak
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-
-# ==========================================================
-# 2. REPRODUCIBILITY
-# ==========================================================
-
+# -------------------------------------------------------------
+# 2. Configuration & Hyperparameters
+# -------------------------------------------------------------
 SEED = 42
+BATCH_SIZE = 32
+NUM_EPOCHS = 25
+LEARNING_RATE = 2e-5
+WEIGHT_DECAY = 1e-2
+IMG_SIZE = 224
+NUM_CLASSES = 6
+# Standard CoAtNet-0 model available in timm
+MODEL_NAME = "coatnet_0_rw_224.sw_in1k" 
 
-random.seed(SEED)
-np.random.seed(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+OUTPUT_DIR = "/kaggle/working/coatnet_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+sns.set_theme(style="whitegrid", palette="muted")
 torch.manual_seed(SEED)
-
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-
-# ==========================================================
-# 3. CONFIGURATION
-# ==========================================================
-
-# IMPORTANT:
-# Use the SAME dataset path as your ViT experiment.
-
-DATASET_PATH = "/kaggle/input/datasets/varun2ks05/rice-leaf-aug/Rice_Leaf_AUG"
-
-IMAGE_SIZE = 224
-
-# Safer for Tesla T4
-BATCH_SIZE = 16
-
-TOTAL_EPOCHS = 25
-
-LEARNING_RATE = 1e-4
-
-WEIGHT_DECAY = 1e-2
-
-LABEL_SMOOTHING = 0.1
-
-OUTPUT_DIR = "CoAtNet"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-
-# ==========================================================
-# 4. DEVICE
-# ==========================================================
-
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-
-print("=" * 60)
-print("CoAtNet RICE LEAF DISEASE CLASSIFICATION")
-print("=" * 60)
-
-print(f"Device: {device}")
-
+print(f"Active Device: {DEVICE}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
+# -------------------------------------------------------------
+# 3. Locate Dataset Path (train, val, test)
+# -------------------------------------------------------------
+DATASET_DIR = None
+if os.path.exists("/kaggle/input/newdata") and os.path.exists("/kaggle/input/newdata/train"):
+    DATASET_DIR = "/kaggle/input/newdata"
+else:
+    matches = glob.glob("/kaggle/input/**/newdata", recursive=True)
+    for p in matches:
+        if os.path.exists(os.path.join(p, "train")):
+            DATASET_DIR = p
+            break
 
-# ==========================================================
-# 5. DATA TRANSFORMS
-# ==========================================================
+if DATASET_DIR is None:
+    matches = glob.glob("/kaggle/input/**/train", recursive=True)
+    if matches:
+        DATASET_DIR = os.path.dirname(matches[0])
+    else:
+        raise FileNotFoundError("Could not find the dataset with 'train', 'val', and 'test' subdirectories.")
 
-# Training augmentation
+print(f"Dataset root identified at: {DATASET_DIR}")
+
+# -------------------------------------------------------------
+# 4. Data Transforms & Loaders (CoAtNet Standard Normalization)
+# -------------------------------------------------------------
+# CoAtNet uses standard ImageNet mean and std
+norm_mean = [0.485, 0.456, 0.406]
+norm_std = [0.229, 0.224, 0.225]
+
 train_transforms = transforms.Compose([
-
-    transforms.Resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
-    ),
-
-    transforms.RandomHorizontalFlip(
-        p=0.5
-    ),
-
-    transforms.RandomVerticalFlip(
-        p=0.2
-    ),
-
-    transforms.RandomRotation(
-        degrees=15
-    ),
-
-    transforms.ColorJitter(
-        brightness=0.15,
-        contrast=0.15,
-        saturation=0.15,
-        hue=0.03
-    ),
-
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=15),
+    transforms.ColorJitter(brightness=0.15, contrast=0.15),
     transforms.ToTensor(),
-
-    # ImageNet normalization for pretrained CoAtNet
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
+    transforms.Normalize(mean=norm_mean, std=norm_std)
 ])
 
-
-# Validation transform
-val_transforms = transforms.Compose([
-
-    transforms.Resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
-    ),
-
+eval_transforms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
+    transforms.Normalize(mean=norm_mean, std=norm_std)
 ])
 
-
-# ==========================================================
-# 6. LOAD DATASET
-# ==========================================================
-
-if not os.path.exists(DATASET_PATH):
-
-    raise FileNotFoundError(
-        f"\nDataset not found at:\n"
-        f"{DATASET_PATH}\n\n"
-        "Make sure the Rice_Leaf_AUG dataset is attached "
-        "to your Kaggle notebook."
-    )
-
-
-print(f"\nDataset path:")
-print(DATASET_PATH)
-
-
-# Temporary dataset only to obtain labels/classes
-base_dataset = datasets.ImageFolder(
-    DATASET_PATH
-)
-
-class_names = base_dataset.classes
-
-num_classes = len(class_names)
-
-targets = np.array(
-    base_dataset.targets
-)
-
-
-print("\n" + "-" * 60)
-print("DATASET INFORMATION")
-print("-" * 60)
-
-print(f"Total images: {len(base_dataset)}")
-
-print(f"Number of classes: {num_classes}")
-
-print("\nClasses:")
-
-for i, name in enumerate(class_names):
-
-    print(
-        f"  {i}: {name}"
-    )
-
-
-# ==========================================================
-# 7. CLASS DISTRIBUTION CHECK
-# ==========================================================
-
-print("\nClass distribution:")
-
-unique_classes, class_counts = np.unique(
-    targets,
-    return_counts=True
-)
-
-for class_id, count in zip(
-    unique_classes,
-    class_counts
-):
-
-    print(
-        f"  {class_names[class_id]:<25} : {count}"
-    )
-
-
-# ==========================================================
-# 8. STRATIFIED 80/20 TRAIN-VALIDATION SPLIT
-# ==========================================================
-
-indices = np.arange(
-    len(base_dataset)
-)
-
-train_indices, val_indices = train_test_split(
-    indices,
-    test_size=0.20,
-    random_state=SEED,
-    stratify=targets
-)
-
-
-print("\n" + "-" * 60)
-print("DATA SPLIT")
-print("-" * 60)
-
-print(
-    f"Training images:   {len(train_indices)}"
-)
-
-print(
-    f"Validation images: {len(val_indices)}"
-)
-
-
-# ==========================================================
-# 9. CREATE TRAINING AND VALIDATION DATASETS
-# ==========================================================
-
-# Separate ImageFolder datasets are used so that
-# augmentation is applied ONLY to training images.
-
-train_full_dataset = datasets.ImageFolder(
-    DATASET_PATH,
-    transform=train_transforms
-)
-
-val_full_dataset = datasets.ImageFolder(
-    DATASET_PATH,
-    transform=val_transforms
-)
-
-
-train_dataset = Subset(
-    train_full_dataset,
-    train_indices
-)
-
-val_dataset = Subset(
-    val_full_dataset,
-    val_indices
-)
-
-
-# ==========================================================
-# 10. DATA LOADERS
-# ==========================================================
-
-pin_memory = device.type == "cuda"
-
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=2,
-    pin_memory=pin_memory
-)
-
-
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=2,
-    pin_memory=pin_memory
-)
-
-
-print("\nDataLoaders created successfully.")
-
-
-# ==========================================================
-# 11. CREATE PRETRAINED CoAtNet
-# ==========================================================
-
-print("\n" + "-" * 60)
-print("LOADING PRETRAINED CoAtNet")
-print("-" * 60)
-
-
-coatnet_model = timm.create_model(
-    "coatnet_0_rw_224.sw_in1k",
-    pretrained=True,
-    num_classes=num_classes
-)
-
-
-coatnet_model = coatnet_model.to(device)
-
-
-print(
-    "CoAtNet model loaded successfully."
-)
-
-print(
-    f"Number of classes: {num_classes}"
-)
-
-
-# ==========================================================
-# 12. TRAINING FUNCTION
-# ==========================================================
-
-def train_coatnet(
-    model,
-    train_loader,
-    val_loader
-):
-
-    # ------------------------------------------------------
-    # Loss function
-    # ------------------------------------------------------
-
-    criterion = nn.CrossEntropyLoss(
-        label_smoothing=LABEL_SMOOTHING
-    )
-
-
-    # ------------------------------------------------------
-    # Optimizer
-    # ------------------------------------------------------
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY
-    )
-
-
-    # ------------------------------------------------------
-    # Cosine learning-rate scheduler
-    # ------------------------------------------------------
-
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=TOTAL_EPOCHS
-    )
-
-
-    # ------------------------------------------------------
-    # Mixed precision
-    # ------------------------------------------------------
-
-    use_amp = device.type == "cuda"
-
-
-    scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=use_amp
-    )
-
-
-    # ------------------------------------------------------
-    # History
-    # ------------------------------------------------------
-
-    history = {
-
-        "train_loss": [],
-        "train_acc": [],
-
-        "val_loss": [],
-        "val_acc": [],
-
-        "learning_rate": []
-    }
-
-
-    # ------------------------------------------------------
-    # Best model tracking
-    # ------------------------------------------------------
-
-    best_val_acc = 0.0
-
-    best_state = None
-
-
-    # ------------------------------------------------------
-    # Training timer
-    # ------------------------------------------------------
-
-    start_time = time.time()
-
-
-    print(
-        f"\nStarting CoAtNet training "
-        f"for {TOTAL_EPOCHS} epochs...\n"
-    )
-
-
-    # ======================================================
-    # EPOCH LOOP
-    # ======================================================
-
-    for epoch in range(TOTAL_EPOCHS):
-
-
-        # ==================================================
-        # TRAINING
-        # ==================================================
-
-        model.train()
-
-        train_loss = 0.0
-
-        train_correct = 0
-
-        train_total = 0
-
-
-        train_bar = tqdm(
-            train_loader,
-            desc=(
-                f"Epoch {epoch + 1:02d}/"
-                f"{TOTAL_EPOCHS} [Train]"
-            )
-        )
-
-
-        for images, labels in train_bar:
-
-            images = images.to(
-                device,
-                non_blocking=True
-            )
-
-            labels = labels.to(
-                device,
-                non_blocking=True
-            )
-
-
-            optimizer.zero_grad(
-                set_to_none=True
-            )
-
-
-            # ----------------------------------------------
-            # Forward pass
-            # ----------------------------------------------
-
-            with torch.amp.autocast(
-                device_type=device.type,
-                enabled=use_amp
-            ):
-
-                outputs = model(images)
-
-                loss = criterion(
-                    outputs,
-                    labels
-                )
-
-
-            # ----------------------------------------------
-            # Backpropagation
-            # ----------------------------------------------
-
-            scaler.scale(
-                loss
-            ).backward()
-
-
-            scaler.step(
-                optimizer
-            )
-
-
-            scaler.update()
-
-
-            # ----------------------------------------------
-            # Statistics
-            # ----------------------------------------------
-
-            train_loss += (
-                loss.item()
-                * images.size(0)
-            )
-
-
-            predictions = outputs.argmax(
-                dim=1
-            )
-
-
-            train_correct += (
-                predictions == labels
-            ).sum().item()
-
-
-            train_total += (
-                labels.size(0)
-            )
-
-
-            train_bar.set_postfix(
-                loss=f"{loss.item():.4f}"
-            )
-
-
-        # ==================================================
-        # TRAINING METRICS
-        # ==================================================
-
-        epoch_train_loss = (
-            train_loss / train_total
-        )
-
-        epoch_train_acc = (
-            train_correct / train_total
-        )
-
-
-        # ==================================================
-        # VALIDATION
-        # ==================================================
-
-        model.eval()
-
-        val_loss = 0.0
-
-        val_correct = 0
-
-        val_total = 0
-
-
-        epoch_preds = []
-
-        epoch_labels = []
-
-
-        with torch.no_grad():
-
-            val_bar = tqdm(
-                val_loader,
-                desc=(
-                    f"Epoch {epoch + 1:02d}/"
-                    f"{TOTAL_EPOCHS} [Val]  "
-                )
-            )
-
-
-            for images, labels in val_bar:
-
-                images = images.to(
-                    device,
-                    non_blocking=True
-                )
-
-                labels = labels.to(
-                    device,
-                    non_blocking=True
-                )
-
-
-                with torch.amp.autocast(
-                    device_type=device.type,
-                    enabled=use_amp
-                ):
-
-                    outputs = model(images)
-
-                    loss = criterion(
-                        outputs,
-                        labels
-                    )
-
-
-                val_loss += (
-                    loss.item()
-                    * images.size(0)
-                )
-
-
-                predictions = outputs.argmax(
-                    dim=1
-                )
-
-
-                val_correct += (
-                    predictions == labels
-                ).sum().item()
-
-
-                val_total += (
-                    labels.size(0)
-                )
-
-
-                epoch_preds.extend(
-                    predictions.cpu().numpy()
-                )
-
-
-                epoch_labels.extend(
-                    labels.cpu().numpy()
-                )
-
-
-        # ==================================================
-        # VALIDATION METRICS
-        # ==================================================
-
-        epoch_val_loss = (
-            val_loss / val_total
-        )
-
-        epoch_val_acc = (
-            val_correct / val_total
-        )
-
-
-        # ==================================================
-        # SAVE HISTORY
-        # ==================================================
-
-        history["train_loss"].append(
-            epoch_train_loss
-        )
-
-        history["train_acc"].append(
-            epoch_train_acc
-        )
-
-        history["val_loss"].append(
-            epoch_val_loss
-        )
-
-        history["val_acc"].append(
-            epoch_val_acc
-        )
-
-        history["learning_rate"].append(
-            optimizer.param_groups[0]["lr"]
-        )
-
-
-        # ==================================================
-        # PRINT SUMMARY
-        # ==================================================
-
-        print(
-            f"\nEpoch {epoch + 1:02d}/"
-            f"{TOTAL_EPOCHS} Summary -> "
-
-            f"Train Loss: "
-            f"{epoch_train_loss:.4f} | "
-
-            f"Train Acc: "
-            f"{epoch_train_acc:.4f} | "
-
-            f"Val Loss: "
-            f"{epoch_val_loss:.4f} | "
-
-            f"Val Acc: "
-            f"{epoch_val_acc:.4f} | "
-
-            f"LR: "
-            f"{optimizer.param_groups[0]['lr']:.2e}\n"
-        )
-
-
-        # ==================================================
-        # SAVE BEST MODEL
-        # ==================================================
-
-        if epoch_val_acc > best_val_acc:
-
-            best_val_acc = epoch_val_acc
-
-            best_state = {
-                key: value.detach().cpu().clone()
-                for key, value
-                in model.state_dict().items()
-            }
-
-            print(
-                f"[✓] New best validation "
-                f"accuracy: "
-                f"{best_val_acc * 100:.2f}%"
-            )
-
-
-        # ==================================================
-        # UPDATE LEARNING RATE
-        # ==================================================
-
-        scheduler.step()
-
-
-    # ======================================================
-    # TOTAL TRAINING TIME
-    # ======================================================
-
-    total_training_time = (
-        time.time() - start_time
-    )
-
-
-    # ======================================================
-    # RESTORE BEST MODEL
-    # ======================================================
-
-    if best_state is not None:
-
-        model.load_state_dict(
-            best_state
-        )
-
-
-    # ======================================================
-    # FINAL VALIDATION
-    # ======================================================
-
+train_dir = os.path.join(DATASET_DIR, "train")
+val_dir = os.path.join(DATASET_DIR, "val") if os.path.exists(os.path.join(DATASET_DIR, "val")) else os.path.join(DATASET_DIR, "validation")
+test_dir = os.path.join(DATASET_DIR, "test")
+
+train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
+val_dataset   = datasets.ImageFolder(val_dir, transform=eval_transforms)
+test_dataset  = datasets.ImageFolder(test_dir, transform=eval_transforms)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+class_names = train_dataset.classes
+NUM_CLASSES = len(class_names)
+print(f"\nDetected {NUM_CLASSES} classes: {class_names}")
+print(f"Dataset split sizes -> Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
+
+# -------------------------------------------------------------
+# 5. CoAtNet Model Architecture (via timm)
+# -------------------------------------------------------------
+print(f"\nLoading CoAtNet model ({MODEL_NAME})...")
+# timm automatically replaces the final classification layer when num_classes is provided!
+model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=NUM_CLASSES)
+model = model.to(DEVICE)
+print("CoAtNet model initialized successfully.")
+
+# -------------------------------------------------------------
+# 6. Loss, Optimizer & Scheduler
+# -------------------------------------------------------------
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+
+# -------------------------------------------------------------
+# 7. Training & Validation Loop
+# -------------------------------------------------------------
+best_val_acc = 0.0
+best_model_path = os.path.join(OUTPUT_DIR, "best_coatnet_rice_model.pth")
+
+history = {
+    "train_loss": [],
+    "val_loss": [],
+    "train_acc": [],
+    "val_acc": []
+}
+
+print("\n--- Starting CoAtNet Training ---")
+start_time = time.time()
+
+for epoch in range(NUM_EPOCHS):
+    # TRAIN
+    model.train()
+    running_loss, correct_train, total_train = 0.0, 0, 0
+    for images, targets in train_loader:
+        images, targets = images.to(DEVICE, non_blocking=True), targets.to(DEVICE, non_blocking=True)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        _, preds = torch.max(outputs, 1)
+        correct_train += (preds == targets).sum().item()
+        total_train += targets.size(0)
+
+    scheduler.step()
+    epoch_train_loss = running_loss / total_train
+    epoch_train_acc = (correct_train / total_train) * 100
+
+    # VALIDATE
     model.eval()
-
-    final_preds = []
-
-    final_labels = []
-
-
+    val_loss, correct_val, total_val = 0.0, 0, 0
     with torch.no_grad():
+        for images, targets in val_loader:
+            images, targets = images.to(DEVICE, non_blocking=True), targets.to(DEVICE, non_blocking=True)
+            outputs = model(images)
+            loss = criterion(outputs, targets)
 
-        for images, labels in val_loader:
+            val_loss += loss.item() * images.size(0)
+            _, preds = torch.max(outputs, 1)
+            correct_val += (preds == targets).sum().item()
+            total_val += targets.size(0)
 
-            images = images.to(
-                device,
-                non_blocking=True
-            )
+    epoch_val_loss = val_loss / total_val
+    epoch_val_acc = (correct_val / total_val) * 100
 
-
-            with torch.amp.autocast(
-                device_type=device.type,
-                enabled=use_amp
-            ):
-
-                outputs = model(images)
-
-
-            predictions = outputs.argmax(
-                dim=1
-            )
-
-
-            final_preds.extend(
-                predictions.cpu().numpy()
-            )
-
-
-            final_labels.extend(
-                labels.numpy()
-            )
-
-
-    return (
-        model,
-        history,
-        final_labels,
-        final_preds,
-        total_training_time,
-        best_val_acc
-    )
-
-
-# ==========================================================
-# 13. TRAIN CoAtNet
-# ==========================================================
-
-(
-    trained_model,
-    history,
-    y_true,
-    y_pred,
-    total_training_time,
-    best_val_acc
-) = train_coatnet(
-    coatnet_model,
-    train_loader,
-    val_loader
-)
-
-
-# ==========================================================
-# 14. CALCULATE METRICS
-# ==========================================================
-
-accuracy = accuracy_score(
-    y_true,
-    y_pred
-)
-
-
-precision = precision_score(
-    y_true,
-    y_pred,
-    average="weighted",
-    zero_division=0
-)
-
-
-recall = recall_score(
-    y_true,
-    y_pred,
-    average="weighted",
-    zero_division=0
-)
-
-
-f1 = f1_score(
-    y_true,
-    y_pred,
-    average="weighted",
-    zero_division=0
-)
-
-
-cm = confusion_matrix(
-    y_true,
-    y_pred,
-    labels=list(range(num_classes))
-)
-
-
-class_accuracy = (
-    cm.diagonal()
-    /
-    np.where(
-        cm.sum(axis=1) == 0,
-        1,
-        cm.sum(axis=1)
-    )
-)
-
-
-hours, remainder = divmod(
-    total_training_time,
-    3600
-)
-
-minutes, seconds = divmod(
-    remainder,
-    60
-)
-
-
-# ==========================================================
-# 15. FINAL RESULTS
-# ==========================================================
-
-print("\n" + "=" * 60)
-print("FINAL CoAtNet EVALUATION METRICS")
-print("=" * 60)
-
-
-print(
-    f"Total Training Time : "
-    f"{int(hours):02d}h "
-    f"{int(minutes):02d}m "
-    f"{seconds:05.2f}s"
-)
-
-
-print(
-    f"Overall Accuracy    : "
-    f"{accuracy * 100:.2f}% "
-    f"({accuracy:.4f})"
-)
-
-
-print(
-    f"Weighted Precision  : "
-    f"{precision:.4f}"
-)
-
-
-print(
-    f"Weighted Recall     : "
-    f"{recall:.4f}"
-)
-
-
-print(
-    f"Weighted F1 Score   : "
-    f"{f1:.4f}"
-)
-
-
-print(
-    f"Best Validation Acc : "
-    f"{best_val_acc * 100:.2f}%"
-)
-
-
-# ==========================================================
-# 16. CLASS-WISE ACCURACY
-# ==========================================================
-
-print("\nCLASS-WISE ACCURACY")
-print("-" * 40)
-
-
-for i, name in enumerate(
-    class_names
-):
+    history["train_loss"].append(epoch_train_loss)
+    history["val_loss"].append(epoch_val_loss)
+    history["train_acc"].append(epoch_train_acc)
+    history["val_acc"].append(epoch_val_acc)
 
     print(
-        f"{name:<30}: "
-        f"{class_accuracy[i] * 100:.2f}% "
-        f"({class_accuracy[i]:.4f})"
+        f"Epoch [{epoch+1:02d}/{NUM_EPOCHS:02d}] "
+        f"| Train Loss: {epoch_train_loss:.4f} Acc: {epoch_train_acc:.2f}% "
+        f"| Val Loss: {epoch_val_loss:.4f} Acc: {epoch_val_acc:.2f}%"
     )
 
+    if epoch_val_acc > best_val_acc:
+        best_val_acc = epoch_val_acc
+        torch.save(model.state_dict(), best_model_path)
+        print(f"  --> Saved new best checkpoint (Val Acc: {best_val_acc:.2f}%)")
 
-# ==========================================================
-# 17. SAVE MAIN METRICS TXT
-# ==========================================================
+elapsed = time.time() - start_time
+print(f"\nTraining completed in {elapsed//60:.0f}m {elapsed%60:.0f}s. Peak Val Accuracy: {best_val_acc:.2f}%")
 
-metrics_path = os.path.join(
-    OUTPUT_DIR,
-    "coatnet_metrics.txt"
+# -------------------------------------------------------------
+# 8. Unbiased Evaluation on Test Set
+# -------------------------------------------------------------
+print("\n" + "=" * 50)
+print("         EVALUATING BEST MODEL ON TEST SET")
+print("=" * 50)
+
+model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
+model.eval()
+
+all_preds = []
+all_targets = []
+
+with torch.no_grad():
+    for images, targets in test_loader:
+        images = images.to(DEVICE)
+        outputs = model(images)
+        _, preds = torch.max(outputs, 1)
+        all_preds.extend(preds.cpu().numpy())
+        all_targets.extend(targets.numpy())
+
+all_preds = np.array(all_preds)
+all_targets = np.array(all_targets)
+
+overall_acc = accuracy_score(all_targets, all_preds) * 100
+macro_prec, macro_rec, macro_f1, _ = precision_recall_fscore_support(
+    all_targets, all_preds, average="macro", zero_division=0
 )
 
+print(f"\nFinal Test Accuracy: {overall_acc:.2f}%")
+print(f"Macro Precision:     {macro_prec*100:.2f}%")
+print(f"Macro Recall:        {macro_rec*100:.2f}%")
+print(f"Macro F1-Score:      {macro_f1*100:.2f}%")
 
-with open(
-    metrics_path,
-    "w",
-    encoding="utf-8"
-) as f:
+cm = confusion_matrix(all_targets, all_preds)
+class_accuracies = (cm.diagonal() / cm.sum(axis=1)) * 100
+rep_dict = classification_report(all_targets, all_preds, target_names=class_names, digits=4, zero_division=0, output_dict=True)
 
-    f.write(
-        "FINAL CoAtNet EVALUATION METRICS\n"
-    )
-
-    f.write("=" * 50 + "\n")
-
-    f.write(
-        "Model: coatnet_0_rw_224.sw_in1k\n"
-    )
-
-    f.write(
-        "Dataset: Rice_Leaf_AUG\n"
-    )
-
-    f.write(
-        f"Total Images: "
-        f"{len(base_dataset)}\n"
-    )
-
-    f.write(
-        f"Training Images: "
-        f"{len(train_indices)}\n"
-    )
-
-    f.write(
-        f"Validation Images: "
-        f"{len(val_indices)}\n"
-    )
-
-    f.write(
-        f"Epochs: "
-        f"{TOTAL_EPOCHS}\n"
-    )
-
-    f.write(
-        f"Batch Size: "
-        f"{BATCH_SIZE}\n"
-    )
-
-    f.write(
-        f"Learning Rate: "
-        f"{LEARNING_RATE}\n"
-    )
-
-    f.write(
-        f"Weight Decay: "
-        f"{WEIGHT_DECAY}\n"
-    )
-
-    f.write(
-        f"Label Smoothing: "
-        f"{LABEL_SMOOTHING}\n"
-    )
-
-    f.write(
-        f"Total Training Time: "
-        f"{int(hours):02d}h "
-        f"{int(minutes):02d}m "
-        f"{seconds:05.2f}s\n"
-    )
-
-    f.write(
-        f"Overall Accuracy: "
-        f"{accuracy * 100:.2f}% "
-        f"({accuracy:.4f})\n"
-    )
-
-    f.write(
-        f"Weighted Precision: "
-        f"{precision:.4f}\n"
-    )
-
-    f.write(
-        f"Weighted Recall: "
-        f"{recall:.4f}\n"
-    )
-
-    f.write(
-        f"Weighted F1 Score: "
-        f"{f1:.4f}\n"
-    )
-
-    f.write(
-        f"Best Validation Accuracy: "
-        f"{best_val_acc * 100:.2f}% "
-        f"({best_val_acc:.4f})\n"
-    )
-
-
-print(
-    f"\n[✓] Saved metrics to: "
-    f"{metrics_path}"
-)
-
-
-# ==========================================================
-# 18. SAVE CLASS-WISE ACCURACY
-# ==========================================================
-
-classwise_path = os.path.join(
-    OUTPUT_DIR,
-    "coatnet_classwise_accuracy.txt"
-)
-
-
-with open(
-    classwise_path,
-    "w",
-    encoding="utf-8"
-) as f:
-
-    f.write(
-        "CoAtNet CLASS-WISE ACCURACY\n"
-    )
-
-    f.write("=" * 50 + "\n\n")
-
-
-    for i, name in enumerate(
-        class_names
-    ):
-
-        f.write(
-            f"{name}: "
-            f"{class_accuracy[i] * 100:.2f}% "
-            f"({class_accuracy[i]:.4f})\n"
-        )
-
-
-print(
-    f"[✓] Saved class-wise accuracy to: "
-    f"{classwise_path}"
-)
-
-
-# ==========================================================
-# 19. CLASSIFICATION REPORT
-# ==========================================================
-
-report_path = os.path.join(
-    OUTPUT_DIR,
-    "coatnet_classification_report.txt"
-)
-
-
-report = classification_report(
-    y_true,
-    y_pred,
-    target_names=class_names,
-    digits=4,
-    zero_division=0
-)
-
-
-with open(
-    report_path,
-    "w",
-    encoding="utf-8"
-) as f:
-
-    f.write(
-        "CoAtNet CLASSIFICATION REPORT\n"
-    )
-
-    f.write("=" * 50 + "\n\n")
-
-    f.write(report)
-
-
-print(
-    f"[✓] Saved classification report to: "
-    f"{report_path}"
-)
-
-
-# ==========================================================
-# 20. ACCURACY GRAPH
-# ==========================================================
-
-accuracy_plot_path = os.path.join(
-    OUTPUT_DIR,
-    "coatnet_accuracy.png"
-)
-
-
-plt.figure(
-    figsize=(10, 6)
-)
-
-
-plt.plot(
-    range(
-        1,
-        TOTAL_EPOCHS + 1
-    ),
-    history["train_acc"],
-    label="Train Accuracy",
-    marker="o"
-)
-
-
-plt.plot(
-    range(
-        1,
-        TOTAL_EPOCHS + 1
-    ),
-    history["val_acc"],
-    label="Validation Accuracy",
-    marker="o"
-)
-
-
-plt.title(
-    "CoAtNet Accuracy Curve"
-)
-
-plt.xlabel(
-    "Epoch"
-)
-
-plt.ylabel(
-    "Accuracy"
-)
-
-plt.grid(True)
-
-plt.legend()
-
+# -------------------------------------------------------------
+# 9. Plotting & Saving Figures
+# -------------------------------------------------------------
+loss_path = os.path.join(OUTPUT_DIR, "canonical_coatnet_loss.png")
+plt.figure(figsize=(8, 4.2))
+plt.plot(range(1, NUM_EPOCHS + 1), history["train_loss"], label="Train Loss", color="#3b6998", linewidth=1.8)
+plt.plot(range(1, NUM_EPOCHS + 1), history["val_loss"], label="Validation Loss", color="#e07b42", linewidth=1.8)
+plt.title("CoAtNet Training and Validation Loss", fontsize=12, fontweight="bold")
+plt.xlabel("Epoch", fontsize=10)
+plt.ylabel("Cross-Entropy Loss", fontsize=10)
+plt.legend(loc="upper right")
 plt.tight_layout()
-
-
-plt.savefig(
-    accuracy_plot_path,
-    dpi=300,
-    bbox_inches="tight"
-)
-
-
-plt.show()
-
+plt.savefig(loss_path, dpi=300)
 plt.close()
 
-
-print(
-    f"[✓] Saved accuracy graph to: "
-    f"{accuracy_plot_path}"
-)
-
-
-# ==========================================================
-# 21. LOSS GRAPH
-# ==========================================================
-
-loss_plot_path = os.path.join(
-    OUTPUT_DIR,
-    "coatnet_loss.png"
-)
-
-
-plt.figure(
-    figsize=(10, 6)
-)
-
-
-plt.plot(
-    range(
-        1,
-        TOTAL_EPOCHS + 1
-    ),
-    history["train_loss"],
-    label="Train Loss",
-    marker="o"
-)
-
-
-plt.plot(
-    range(
-        1,
-        TOTAL_EPOCHS + 1
-    ),
-    history["val_loss"],
-    label="Validation Loss",
-    marker="o"
-)
-
-
-plt.title(
-    "CoAtNet Loss Curve"
-)
-
-plt.xlabel(
-    "Epoch"
-)
-
-plt.ylabel(
-    "Loss"
-)
-
-plt.grid(True)
-
-plt.legend()
-
+acc_path = os.path.join(OUTPUT_DIR, "canonical_coatnet_acc.png")
+plt.figure(figsize=(8, 4.2))
+plt.plot(range(1, NUM_EPOCHS + 1), history["train_acc"], label="Train Accuracy", color="#3b6998", linewidth=1.8)
+plt.plot(range(1, NUM_EPOCHS + 1), history["val_acc"], label="Validation Accuracy", color="#e07b42", linewidth=1.8)
+plt.axhline(y=best_val_acc, color="gray", linestyle="--", alpha=0.7, label=f"Best Val Accuracy: {best_val_acc:.2f}%")
+plt.title("CoAtNet Training and Validation Accuracy", fontsize=12, fontweight="bold")
+plt.xlabel("Epoch", fontsize=10)
+plt.ylabel("Accuracy (%)", fontsize=10)
+plt.legend(loc="lower right")
 plt.tight_layout()
-
-
-plt.savefig(
-    loss_plot_path,
-    dpi=300,
-    bbox_inches="tight"
-)
-
-
-plt.show()
-
+plt.savefig(acc_path, dpi=300)
 plt.close()
 
-
-print(
-    f"[✓] Saved loss graph to: "
-    f"{loss_plot_path}"
-)
-
-
-# ==========================================================
-# 22. CONFUSION MATRIX
-# ==========================================================
-
-confusion_path = os.path.join(
-    OUTPUT_DIR,
-    "coatnet_confusion_matrix.png"
-)
-
-
-plt.figure(
-    figsize=(10, 8)
-)
-
-
-sns.heatmap(
-    cm,
-    annot=True,
-    fmt="d",
-    cmap="Blues",
-    xticklabels=class_names,
-    yticklabels=class_names
-)
-
-
-plt.title(
-    "CoAtNet Confusion Matrix"
-)
-
-plt.ylabel(
-    "Actual Class"
-)
-
-plt.xlabel(
-    "Predicted Class"
-)
-
-plt.xticks(
-    rotation=45,
-    ha="right"
-)
-
-plt.yticks(
-    rotation=0
-)
-
+cm_path = os.path.join(OUTPUT_DIR, "canonical_coatnet_cm.png")
+plt.figure(figsize=(7.5, 6))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names, cbar=True)
+plt.title("CoAtNet Confusion Matrix", fontsize=12, fontweight="bold", pad=12)
+plt.xlabel("Predicted Class", fontsize=10, fontweight="bold")
+plt.ylabel("True Class", fontsize=10, fontweight="bold")
+plt.xticks(rotation=35, ha="right", fontsize=8)
+plt.yticks(rotation=0, fontsize=8)
 plt.tight_layout()
-
-
-plt.savefig(
-    confusion_path,
-    dpi=300,
-    bbox_inches="tight"
-)
-
-
-plt.show()
-
+plt.savefig(cm_path, dpi=300)
 plt.close()
 
-
-print(
-    f"[✓] Saved confusion matrix to: "
-    f"{confusion_path}"
-)
-
-
-# ==========================================================
-# 23. SAVE MODEL
-# ==========================================================
-
-model_path = os.path.join(
-    OUTPUT_DIR,
-    "coatnet_rice_leaf_final.pth"
-)
-
-
-torch.save(
-    trained_model.state_dict(),
-    model_path
-)
-
-
-print(
-    f"\n[✓] Model saved to: "
-    f"{model_path}"
-)
-
-
-# ==========================================================
-# 24. CREATE PDF REPORT
-# ==========================================================
-
-pdf_path = os.path.join(
-    OUTPUT_DIR,
-    "CoAtNet Output.pdf"
-)
-
-
-with PdfPages(pdf_path) as pdf:
-
-
-    # ------------------------------------------------------
-    # Page 1: Metrics
-    # ------------------------------------------------------
-
-    fig = plt.figure(
-        figsize=(8.27, 11.69)
-    )
-
-    plt.axis("off")
-
-
-    metric_text = (
-
-        "CoAtNet RICE LEAF DISEASE CLASSIFICATION\n"
-
-        + "=" * 45
-
-        + "\n\n"
-
-        f"Model: coatnet_0_rw_224.sw_in1k\n"
-
-        f"Dataset: Rice_Leaf_AUG\n"
-
-        f"Total Images: {len(base_dataset)}\n"
-
-        f"Training Images: {len(train_indices)}\n"
-
-        f"Validation Images: {len(val_indices)}\n"
-
-        f"Epochs: {TOTAL_EPOCHS}\n"
-
-        f"Batch Size: {BATCH_SIZE}\n"
-
-        f"Learning Rate: {LEARNING_RATE}\n"
-
-        f"Weight Decay: {WEIGHT_DECAY}\n"
-
-        f"Label Smoothing: {LABEL_SMOOTHING}\n\n"
-
-        f"Training Time: "
-        f"{int(hours):02d}h "
-        f"{int(minutes):02d}m "
-        f"{seconds:05.2f}s\n\n"
-
-        f"Accuracy: "
-        f"{accuracy * 100:.2f}%\n"
-
-        f"Precision: "
-        f"{precision:.4f}\n"
-
-        f"Recall: "
-        f"{recall:.4f}\n"
-
-        f"F1 Score: "
-        f"{f1:.4f}\n"
-
-        f"Best Validation Accuracy: "
-        f"{best_val_acc * 100:.2f}%\n"
-    )
-
-
-    plt.text(
-        0.08,
-        0.92,
-        metric_text,
-        fontsize=13,
-        verticalalignment="top",
-        family="monospace"
-    )
-
-
-    pdf.savefig(
-        fig,
-        bbox_inches="tight"
-    )
-
-    plt.close(fig)
-
-
-    # ------------------------------------------------------
-    # Page 2: Accuracy
-    # ------------------------------------------------------
-
-    fig = plt.figure(
-        figsize=(10, 6)
-    )
-
-
-    plt.plot(
-        range(
-            1,
-            TOTAL_EPOCHS + 1
-        ),
-        history["train_acc"],
-        label="Train Accuracy",
-        marker="o"
-    )
-
-
-    plt.plot(
-        range(
-            1,
-            TOTAL_EPOCHS + 1
-        ),
-        history["val_acc"],
-        label="Validation Accuracy",
-        marker="o"
-    )
-
-
-    plt.title(
-        "CoAtNet Accuracy Curve"
-    )
-
-    plt.xlabel(
-        "Epoch"
-    )
-
-    plt.ylabel(
-        "Accuracy"
-    )
-
-    plt.grid(True)
-
-    plt.legend()
-
-    plt.tight_layout()
-
-
-    pdf.savefig(fig)
-
-    plt.close(fig)
-
-
-    # ------------------------------------------------------
-    # Page 3: Loss
-    # ------------------------------------------------------
-
-    fig = plt.figure(
-        figsize=(10, 6)
-    )
-
-
-    plt.plot(
-        range(
-            1,
-            TOTAL_EPOCHS + 1
-        ),
-        history["train_loss"],
-        label="Train Loss",
-        marker="o"
-    )
-
-
-    plt.plot(
-        range(
-            1,
-            TOTAL_EPOCHS + 1
-        ),
-        history["val_loss"],
-        label="Validation Loss",
-        marker="o"
-    )
-
-
-    plt.title(
-        "CoAtNet Loss Curve"
-    )
-
-    plt.xlabel(
-        "Epoch"
-    )
-
-    plt.ylabel(
-        "Loss"
-    )
-
-    plt.grid(True)
-
-    plt.legend()
-
-    plt.tight_layout()
-
-
-    pdf.savefig(fig)
-
-    plt.close(fig)
-
-
-    # ------------------------------------------------------
-    # Page 4: Confusion Matrix
-    # ------------------------------------------------------
-
-    fig = plt.figure(
-        figsize=(10, 8)
-    )
-
-
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt="d",
-        cmap="Blues",
-        xticklabels=class_names,
-        yticklabels=class_names
-    )
-
-
-    plt.title(
-        "CoAtNet Confusion Matrix"
-    )
-
-    plt.ylabel(
-        "Actual Class"
-    )
-
-    plt.xlabel(
-        "Predicted Class"
-    )
-
-    plt.xticks(
-        rotation=45,
-        ha="right"
-    )
-
-    plt.yticks(
-        rotation=0
-    )
-
-    plt.tight_layout()
-
-
-    pdf.savefig(fig)
-
-    plt.close(fig)
-
-
-print(
-    f"[✓] PDF report saved to: "
-    f"{pdf_path}"
-)
-
-
-# ==========================================================
-# 25. FINAL OUTPUT SUMMARY
-# ==========================================================
-
-print("\n" + "=" * 60)
-
-print(
-    "CoAtNet TRAINING COMPLETED SUCCESSFULLY"
-)
-
-print("=" * 60)
-
-
-print("\nOutput files:")
-
-
-for filename in sorted(
-    os.listdir(OUTPUT_DIR)
-):
-
-    print(
-        f"  ✓ {os.path.join(OUTPUT_DIR, filename)}"
-    )
-
-
-print("\nFinal Metrics:")
-
-print(
-    f"  Accuracy : "
-    f"{accuracy * 100:.2f}%"
-)
-
-print(
-    f"  Precision: "
-    f"{precision:.4f}"
-)
-
-print(
-    f"  Recall   : "
-    f"{recall:.4f}"
-)
-
-print(
-    f"  F1 Score : "
-    f"{f1:.4f}"
-)
-
-print(
-    f"  Best Val : "
-    f"{best_val_acc * 100:.2f}%"
-)
-
-
-print("\nDone.")
+bar_path = os.path.join(OUTPUT_DIR, "canonical_coatnet_bar.png")
+plt.figure(figsize=(8, 4.2))
+bars = plt.bar(class_names, class_accuracies, color="#3b75af", width=0.65)
+plt.title("CoAtNet Class-wise Test Accuracy", fontsize=12, fontweight="bold")
+plt.xlabel("Rice Leaf Disease Class", fontsize=10)
+plt.ylabel("Accuracy (%)", fontsize=10)
+plt.ylim(0, 108)
+plt.xticks(rotation=30, ha="right", fontsize=8)
+for b in bars:
+    y = b.get_height()
+    plt.text(b.get_x() + b.get_width()/2.0, y + 1.5, f"{y:.2f}%", ha="center", va="bottom", fontsize=8)
+plt.tight_layout()
+plt.savefig(bar_path, dpi=300)
+plt.close()
+
+# -------------------------------------------------------------
+# 10. Multi-Section Structured PDF Report Generation
+# -------------------------------------------------------------
+REPORT_PDF_PATH = os.path.join(OUTPUT_DIR, "CoAtNet_Canonical_V1_Experiment_Report.pdf")
+styles = getSampleStyleSheet()
+
+title_style = ParagraphStyle('DocTitle', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=18, leading=22, alignment=0)
+sub_style = ParagraphStyle('DocSub', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=12, leading=15, textColor=colors.HexColor("#2C3E50"))
+desc_style = ParagraphStyle('DocDesc', parent=styles['Normal'], fontName='Helvetica-Oblique', fontSize=9, leading=12, textColor=colors.dimgrey)
+h2_style = ParagraphStyle('Heading2Custom', fontName='Helvetica-Bold', fontSize=11, leading=14, spaceBefore=8, spaceAfter=4)
+body_style = ParagraphStyle('BodyCustom', fontName='Helvetica', fontSize=8.5, leading=11)
+
+def get_standard_table_style():
+    return TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F2F4F7")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor("#1A202C")),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+    ])
+
+story = []
+
+# Document Header
+story.append(Paragraph("Rice Leaf Disease Classification", title_style))
+story.append(Paragraph("CoAtNet-0 | Canonical Dataset V1", sub_style))
+story.append(Paragraph("Final evaluation after training on the canonical stratified 80/10/10 dataset.", desc_style))
+story.append(Spacer(1, 10))
+
+# 1. Experiment Configuration
+story.append(Paragraph("1. Experiment Configuration", h2_style))
+config_data = [
+    ["Parameter", "Value"],
+    ["Model Architecture", "CoAtNet-0"],
+    ["Model Tag (timm)", MODEL_NAME],
+    ["Image Size", f"{IMG_SIZE} x {IMG_SIZE}"],
+    ["Batch Size", str(BATCH_SIZE)],
+    ["Epochs", str(NUM_EPOCHS)],
+    ["Learning Rate", str(LEARNING_RATE)],
+    ["Weight Decay", str(WEIGHT_DECAY)],
+    ["Optimizer", "AdamW"],
+    ["Scheduler", "CosineAnnealingLR"],
+    ["Random Seed", str(SEED)],
+    ["Device", str(DEVICE)],
+    ["GPU", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None"]
+]
+t1 = Table(config_data, colWidths=[200, 320])
+t1.setStyle(get_standard_table_style())
+story.append(t1)
+story.append(Spacer(1, 10))
+
+# 2. Canonical Dataset
+story.append(Paragraph("2. Canonical Dataset", h2_style))
+dataset_summary = [
+    ["Split", "Images", "Usage"],
+    ["Train", str(len(train_dataset)), "Model training"],
+    ["Validation", str(len(val_dataset)), "Checkpoint selection / evaluation"],
+    ["Test", str(len(test_dataset)), "Final holdout benchmark"]
+]
+t2 = Table(dataset_summary, colWidths=[120, 100, 300])
+t2.setStyle(get_standard_table_style())
+story.append(t2)
+story.append(Spacer(1, 4))
+story.append(Paragraph(f"<b>Canonical dataset path:</b> {DATASET_DIR}", body_style))
+story.append(Spacer(1, 10))
+
+# 3. Final Metrics
+best_epoch_idx = int(np.argmax(history["val_acc"])) + 1
+story.append(Paragraph("3. Final Validation & Test Metrics", h2_style))
+metrics_summary = [
+    ["Metric", "Result"],
+    ["Best Validation Accuracy", f"{best_val_acc:.2f}%"],
+    ["Best Epoch", str(best_epoch_idx)],
+    ["Final Test Accuracy", f"{overall_acc:.2f}%"],
+    ["Macro Precision", f"{macro_prec*100:.2f}%"],
+    ["Macro Recall", f"{macro_rec*100:.2f}%"],
+    ["Macro F1-Score", f"{macro_f1*100:.2f}%"]
+]
+t3 = Table(metrics_summary, colWidths=[220, 300])
+t3.setStyle(get_standard_table_style())
+story.append(t3)
+story.append(Spacer(1, 10))
+
+# 4. Classification Report
+story.append(Paragraph("4. Classification Report", h2_style))
+clf_table_data = [["Class", "precision", "recall", "f1-score", "support"]]
+for c in class_names:
+    clf_table_data.append([
+        c,
+        f"{rep_dict[c]['precision']:.4f}",
+        f"{rep_dict[c]['recall']:.4f}",
+        f"{rep_dict[c]['f1-score']:.4f}",
+        str(int(rep_dict[c]['support']))
+    ])
+clf_table_data.append([
+    "accuracy", "", "", f"{rep_dict['accuracy']:.4f}", str(len(all_targets))
+])
+clf_table_data.append([
+    "macro avg",
+    f"{rep_dict['macro avg']['precision']:.4f}",
+    f"{rep_dict['macro avg']['recall']:.4f}",
+    f"{rep_dict['macro avg']['f1-score']:.4f}",
+    str(len(all_targets))
+])
+clf_table_data.append([
+    "weighted avg",
+    f"{rep_dict['weighted avg']['precision']:.4f}",
+    f"{rep_dict['weighted avg']['recall']:.4f}",
+    f"{rep_dict['weighted avg']['f1-score']:.4f}",
+    str(len(all_targets))
+])
+t4 = Table(clf_table_data, colWidths=[180, 85, 85, 85, 85])
+t4.setStyle(get_standard_table_style())
+story.append(t4)
+story.append(Spacer(1, 10))
+
+# 5. Confusion Matrix (Numeric Table)
+story.append(Paragraph("5. Confusion Matrix", h2_style))
+cm_table_data = [["True \\ Pred"] + [str(i) for i in range(len(class_names))]]
+for row_idx, row in enumerate(cm):
+    cm_table_data.append([str(row_idx)] + [str(val) for val in row])
+t5 = Table(cm_table_data, colWidths=[90] + [70] * len(class_names))
+t5.setStyle(get_standard_table_style())
+story.append(t5)
+story.append(Spacer(1, 4))
+
+mapping_lines = "<br/>".join([f"<b>{i}</b> = {cls}" for i, cls in enumerate(class_names)])
+story.append(Paragraph(f"<b>Class index mapping:</b><br/>{mapping_lines}", body_style))
+story.append(Spacer(1, 12))
+
+# 6. Training Curves
+story.append(PageBreak())
+story.append(Paragraph("6. Training Curves", h2_style))
+story.append(RLImage(loss_path, width=480, height=220))
+story.append(Spacer(1, 8))
+story.append(RLImage(acc_path, width=480, height=220))
+story.append(Spacer(1, 12))
+
+# 7 & 8: Visual Confusion Matrix & Class-wise Acc
+story.append(Paragraph("7. Confusion Matrix Visualization", h2_style))
+story.append(RLImage(cm_path, width=400, height=310))
+story.append(Spacer(1, 10))
+
+story.append(Paragraph("8. Class-wise Accuracy", h2_style))
+story.append(RLImage(bar_path, width=480, height=210))
+story.append(Spacer(1, 12))
+
+# 9. Complete Epoch History Table
+story.append(PageBreak())
+story.append(Paragraph("9. Complete Epoch History", h2_style))
+hist_table_data = [["Epoch", "Train Loss", "Train Acc", "Val Loss", "Val Acc", "LR"]]
+
+lr_schedule = [
+    1e-6 + 0.5 * (LEARNING_RATE - 1e-6) * (1 + np.cos(np.pi * ep / NUM_EPOCHS))
+    for ep in range(NUM_EPOCHS)
+]
+
+for ep in range(NUM_EPOCHS):
+    hist_table_data.append([
+        str(ep + 1),
+        f"{history['train_loss'][ep]:.4f}",
+        f"{history['train_acc'][ep]:.2f}%",
+        f"{history['val_loss'][ep]:.4f}",
+        f"{history['val_acc'][ep]:.2f}%",
+        f"{lr_schedule[ep]:.2e}"
+    ])
+
+t9 = Table(hist_table_data, colWidths=[60, 90, 90, 90, 90, 100])
+t9.setStyle(get_standard_table_style())
+story.append(t9)
+story.append(Spacer(1, 14))
+
+# 10. Experiment Notes
+story.append(Paragraph("10. Experiment Notes", h2_style))
+notes = [
+    "• The dataset uses the canonical stratified 80/10/10 split.",
+    "• Random seed: 42 ensures reproducibility across runs.",
+    "• Model uses a CoAtNet-0 (coatnet_0_rw_224) architecture, bridging the gap between Convolutional Neural Networks and Transformers.",
+    "• Model initialized and configured using the timm (PyTorch Image Models) ecosystem."
+]
+
+for note in notes:
+    story.append(Paragraph(note, body_style))
+    story.append(Spacer(1, 4))
+
+# Build PDF
+doc = SimpleDocTemplate(REPORT_PDF_PATH, pagesize=letter)
+doc.build(story)
+print(f"\nPDF Report successfully generated at: {REPORT_PDF_PATH}")
